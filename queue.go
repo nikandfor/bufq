@@ -52,9 +52,9 @@ const (
 	Cancel = -1
 
 	// slot states
-	sizeWriting = Cancel - iota
+	sizeAllocated = Cancel - iota
 	// sizeCommitted = positive size or Cancel
-	sizeReading
+	sizeConsuming
 	sizeFree
 )
 
@@ -178,7 +178,7 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int
 		msg := q.qw
 		q.qw++
 
-		q.q[q.Msg(msg)] = slot{start: q.w, size: sizeWriting}
+		q.q[q.Msg(msg)] = slot{start: q.w, size: sizeAllocated}
 
 		st := q.start(q.w)
 		end := st + size
@@ -210,11 +210,11 @@ func (q *Queue) commit(msg int64, size int) {
 		size = Cancel
 	}
 
-	if q.q[q.Msg(msg)].size != sizeWriting {
-		return
+	if q.q[q.Msg(msg)].size != sizeAllocated {
+		panic("bufq: Queue misuse: message commit wasn't expected")
 	}
 
-	if size > 0 {
+	if size > 0 && q.b != 0 {
 		cur := q.q[q.Msg(msg)]
 		next := q.q[q.Msg(msg+1)]
 
@@ -238,35 +238,6 @@ func (q *Queue) Consume(blocking bool) (msg int64, st, end int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
-	return q.consume(blocking)
-}
-
-func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
-	defer q.mu.Unlock()
-	q.mu.Lock()
-
-	for n < len(buf) {
-		msg, st, end := q.consume(blocking && n == 0)
-		if msg < 0 && n > 0 {
-			return n
-		}
-		if msg < 0 {
-			return int(msg)
-		}
-
-		buf[n] = Message{
-			Msg:   msg,
-			Start: st,
-			Size:  end - st,
-		}
-
-		n++
-	}
-
-	return n
-}
-
-func (q *Queue) consume(blocking bool) (msg int64, st, end int) {
 	for {
 		for msg := q.qr; msg < q.qw; msg++ {
 			s := q.q[q.Msg(msg)]
@@ -277,7 +248,7 @@ func (q *Queue) consume(blocking bool) (msg int64, st, end int) {
 			st := q.start(s.start)
 			end := st + s.size
 
-			q.q[q.Msg(msg)].size = sizeReading
+			q.q[q.Msg(msg)].size = sizeConsuming
 
 			return q.msg(msg), st, end
 		}
@@ -294,9 +265,59 @@ func (q *Queue) consume(blocking bool) (msg int64, st, end int) {
 	}
 }
 
+func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
+	defer q.mu.Unlock()
+	q.mu.Lock()
+
+	for {
+		if q.closed && q.qr == q.qw {
+			return Closed
+		}
+
+		n = q.consumeN(buf)
+		if n > 0 {
+			return n
+		}
+		if !blocking {
+			return WouldBlock
+		}
+
+		q.cond.Wait()
+	}
+}
+
+func (q *Queue) consumeN(buf []Message) (n int) {
+	for msg := q.qr; n < len(buf) && msg < q.qw; msg++ {
+		s := q.q[q.Msg(msg)]
+		if s.size < 0 {
+			continue
+		}
+
+		st := q.start(s.start)
+		end := st + s.size
+
+		q.q[q.Msg(msg)].size = sizeConsuming
+
+		buf[n] = Message{
+			Msg:   q.msg(msg),
+			Start: st,
+			Size:  end - st,
+		}
+
+		n++
+	}
+
+	return n
+}
+
 func (q *Queue) Done(msg int64) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
+
+	s := q.q[q.Msg(msg)]
+	if s.size != sizeConsuming && s.size != Cancel {
+		panic("bufq: Queue misuse: done message which wasn't consumed")
+	}
 
 	q.q[q.Msg(msg)].size = sizeFree
 
@@ -312,6 +333,11 @@ func (q *Queue) DoneN(ms []Message) {
 	q.mu.Lock()
 
 	for _, m := range ms {
+		s := q.q[q.Msg(m.Msg)]
+		if s.size != sizeConsuming && s.size != Cancel {
+			panic("bufq: Queue misuse: done message which wasn't consumed")
+		}
+
 		q.q[q.Msg(m.Msg)].size = sizeFree
 	}
 
@@ -359,6 +385,10 @@ func (q *Queue) Close() error {
 	return nil
 }
 
+func (q *Queue) Size() (n, buf int) {
+	return len(q.q), int(q.b)
+}
+
 func (q *Queue) len() int {
 	defer q.mu.Unlock()
 	q.mu.Lock()
@@ -396,11 +426,11 @@ func (q *Queue) state() (x uint64) {
 		switch {
 		case s.size == sizeFree:
 			// x |= 0 << sh
-		case s.size == sizeWriting:
+		case s.size == sizeAllocated:
 			x |= 1 << sh
 		case s.size >= 0:
 			x |= 2 << sh
-		case s.size == sizeReading:
+		case s.size == sizeConsuming:
 			x |= 3 << sh
 		case s.size == Cancel:
 			x |= 4 << sh
@@ -460,6 +490,7 @@ func (q *Queue) dump() string {
 }
 */
 
+func (m Message) End() int             { return m.Start + m.Size }
 func (m Message) StartEnd() (int, int) { return m.Start, m.Start + m.Size }
 func (m *Message) Cancel()             { m.Size = Cancel }
 
