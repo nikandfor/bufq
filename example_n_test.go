@@ -64,7 +64,7 @@ func Example_n() {
 				if err == nil {
 					for i := range used {
 						// meta[msg].Addr = msgs[i].Addr
-						// batch[i].SetSize(msgs[i].N)
+						// batch[i].Size = msgs[i].N
 						_ = i
 					}
 				}

@@ -34,7 +34,7 @@ func TestQueue(tb *testing.T) {
 
 	_ = q.Close()
 
-	exp := 0
+	consumed := 0
 
 	for {
 		m := q.ConsumeN(false, ms)
@@ -51,18 +51,18 @@ func TestQueue(tb *testing.T) {
 
 			tb.Logf("got msg %v  set %v", msg, meta[msg])
 
-			if meta[msg] != exp*7 {
-				tb.Errorf("wanted %v, got %v", exp, meta[j])
+			if meta[msg] != consumed*7 {
+				tb.Errorf("wanted %v, got %v", consumed, meta[msg])
 			}
 
-			exp++
+			consumed++
 		}
 
 		q.DoneN(ms[:m])
 	}
 
-	if exp != len(ms)*N {
-		tb.Errorf("wanted %v, got %v", exp, len(ms)*N)
+	if consumed != len(ms)*N {
+		tb.Errorf("wanted %v, got %v", len(ms)*N, consumed)
 	}
 }
 
@@ -79,7 +79,7 @@ func TestQueueParallel(tb *testing.T) {
 
 	q := bufq.New(len(meta), len(b))
 
-	q.Flags |= 1 << bufq.FlagFullMsg
+	q.Flags.Set(bufq.FlagFullMsg)
 
 	wg.Add(N)
 	wwg.Add(N)

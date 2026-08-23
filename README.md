@@ -10,6 +10,23 @@
 `bufq` is a queue for efficiently passing chunks of a ring buffer along with their metadata.
 The initial task was to read and process over 1 Gbit/s of small UDP packets.
 
+## Workflow
+
+A message travels through two hands.
+
+	producer:  Allocate -> write b[st:end] and meta[msg] -> Commit
+	consumer:  Consume  -> read  b[st:end] and meta[msg] -> Done
+
+`Allocate` reserves a slot and a chunk of the ring buffer, `Commit` publishes the bytes actually written,
+or cancels the message. `Consume` gives it to exactly one consumer, `Done` releases it.
+
+Committed messages are consumed in any order, but buffer space comes back in allocation order:
+a message in flight holds its own chunk and everything allocated after it.
+So the buffer stays a plain ring and never fragments.
+
+Every step has a batch form (`AllocateN`, `CommitN`, `ConsumeN`, `DoneN`) and can block or not.
+`Close` wakes all the waiters up; messages already committed are still consumed.
+
 ## Usage
 
 The queue operates solely with indexes, which makes it independent of the buffer and metadata types, as well as their storage locations.

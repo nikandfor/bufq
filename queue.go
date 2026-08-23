@@ -1,10 +1,9 @@
+// Package bufq is a queue of chunks of a shared ring buffer, passed by indexes.
 package bufq
 
 import (
 	"fmt"
 	"math/bits"
-	"path/filepath"
-	"runtime"
 	"sync"
 )
 
@@ -15,6 +14,7 @@ type (
 
 		q      []slot
 		qr, qw int64
+		qc     int64 // first slot that can still become consumable
 
 		b    int64
 		r, w int64
@@ -60,8 +60,8 @@ const (
 
 const (
 	// FlagFullMsg makes Allocate to return always increasing message number.
-	// Queue.Msg can be used to wrap it to buffer index.
-	FlagFullMsg = 1 << iota
+	// Queue.Msg can be used to wrap it to queue index.
+	FlagFullMsg Flags = 1 << iota
 )
 
 var (
@@ -69,27 +69,29 @@ var (
 	ErrWouldBlock Error = WouldBlock
 )
 
+// New makes a queue of n messages over a buf bytes ring buffer.
+// buf == 0 makes a metadata only queue: all sizes must be 0.
 func New(n, buf int) *Queue {
 	q := &Queue{}
-	q.Reset(n, buf)
+	q.ResetSize(n, buf)
 
 	return q
 }
 
-func (q *Queue) ResetSame() {
-	q.Reset(len(q.q), int(q.b))
+// Reset restarts the queue keeping its size. Messages in flight are dropped.
+// All the users must be stopped first and must not reuse their msg values.
+func (q *Queue) Reset() {
+	q.ResetSize(len(q.q), int(q.b))
 }
 
-func (q *Queue) Reset(n, buf int) {
-	if n&0x3 != 0 {
+// ResetSize restarts the queue with a new size. Same access rules as Reset.
+func (q *Queue) ResetSize(n, buf int) {
+	if n < 0x4 || n&0x3 != 0 {
 		panic(n)
 	}
-	if buf&0xf != 0 {
+	if buf < 0 || buf&0xf != 0 {
 		panic(buf)
 	}
-
-	defer q.mu.Unlock()
-	q.mu.Lock()
 
 	q.cond.L = &q.mu
 
@@ -100,6 +102,7 @@ func (q *Queue) Reset(n, buf int) {
 	}
 
 	q.qr, q.qw = 0, 0
+	q.qc = 0
 
 	q.b = int64(buf)
 	q.r, q.w = 0, 0
@@ -107,24 +110,24 @@ func (q *Queue) Reset(n, buf int) {
 	q.closed = false
 }
 
+// Allocate reserves a message and size bytes at st..end, aligned to align.
+// msg is negative on error. Each message must be Committed.
 func (q *Queue) Allocate(size, align int, blocking bool) (msg int64, st, end int) {
-	if align > 0 {
-		align = alignAlign(align)
-	}
-
 	defer q.mu.Unlock()
 	q.mu.Lock()
+
+	align = alignAlign(align)
 
 	return q.allocate(size, align, blocking)
 }
 
+// AllocateN fills buf with up to len(buf) messages. It only blocks for the first one.
+// n is negative on error.
 func (q *Queue) AllocateN(size, align int, blocking bool, buf []Message) (n int) {
-	if align > 0 {
-		align = alignAlign(align)
-	}
-
 	defer q.mu.Unlock()
 	q.mu.Lock()
+
+	align = alignAlign(align)
 
 	for n < len(buf) {
 		msg, st, end := q.allocate(size, align, blocking && n == 0)
@@ -151,6 +154,12 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int
 	//	defer func() {
 	//		log.Printf("allocate %5v -> %3x  from %v %v %v", blocking, msg, caller(1), caller(2), caller(3))
 	//	}()
+	if size < 0 || int64(size) > q.b || size != 0 && q.b == 0 {
+		panic(size)
+	}
+	if align < 0 || align != 0 && q.b%int64(align) != 0 {
+		panic(align)
+	}
 
 	for {
 		if q.closed {
@@ -189,6 +198,8 @@ func (q *Queue) allocate(size, align int, blocking bool) (msg int64, st, end int
 	}
 }
 
+// Commit publishes the first size bytes of the message to consumers.
+// Cancel drops it instead.
 func (q *Queue) Commit(msg int64, size int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
@@ -196,6 +207,7 @@ func (q *Queue) Commit(msg int64, size int) {
 	q.commit(msg, size)
 }
 
+// CommitN commits messages using their Size field.
 func (q *Queue) CommitN(ms []Message) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
@@ -234,12 +246,16 @@ func (q *Queue) commit(msg int64, size int) {
 	}
 }
 
+// Consume takes a committed message. msg is negative on error.
+// Each message must be Done.
 func (q *Queue) Consume(blocking bool) (msg int64, st, end int) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
 	for {
-		for msg := q.qr; msg < q.qw; msg++ {
+		q.skipConsumed()
+
+		for msg := q.qc; msg < q.qw; msg++ {
 			s := q.q[q.Msg(msg)]
 			if s.size < 0 {
 				continue
@@ -253,7 +269,7 @@ func (q *Queue) Consume(blocking bool) (msg int64, st, end int) {
 			return q.msg(msg), st, end
 		}
 
-		if q.qr == q.qw && q.closed {
+		if q.qc == q.qw && q.closed {
 			return Closed, 0, 0
 		}
 
@@ -265,12 +281,19 @@ func (q *Queue) Consume(blocking bool) (msg int64, st, end int) {
 	}
 }
 
+// ConsumeN fills buf with up to len(buf) committed messages. n is negative on error.
 func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
+	if len(buf) == 0 {
+		return 0
+	}
+
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
 	for {
-		if q.closed && q.qr == q.qw {
+		q.skipConsumed()
+
+		if q.closed && q.qc == q.qw {
 			return Closed
 		}
 
@@ -287,7 +310,7 @@ func (q *Queue) ConsumeN(blocking bool, buf []Message) (n int) {
 }
 
 func (q *Queue) consumeN(buf []Message) (n int) {
-	for msg := q.qr; n < len(buf) && msg < q.qw; msg++ {
+	for msg := q.qc; n < len(buf) && msg < q.qw; msg++ {
 		s := q.q[q.Msg(msg)]
 		if s.size < 0 {
 			continue
@@ -310,12 +333,27 @@ func (q *Queue) consumeN(buf []Message) (n int) {
 	return n
 }
 
+// skipConsumed moves qc over the slots that can't become consumable again.
+func (q *Queue) skipConsumed() {
+	q.qc = max(q.qr, q.qc)
+
+	for q.qc < q.qw {
+		s := q.q[q.Msg(q.qc)]
+		if s.size == sizeAllocated || s.size >= 0 {
+			break
+		}
+
+		q.qc++
+	}
+}
+
+// Done returns the message buffer to producers.
 func (q *Queue) Done(msg int64) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
 
 	s := q.q[q.Msg(msg)]
-	if s.size != sizeConsuming && s.size != Cancel {
+	if s.size != sizeConsuming {
 		panic("bufq: Queue misuse: done message which wasn't consumed")
 	}
 
@@ -324,6 +362,7 @@ func (q *Queue) Done(msg int64) {
 	q.done()
 }
 
+// DoneN returns the message buffers to producers.
 func (q *Queue) DoneN(ms []Message) {
 	if len(ms) == 0 {
 		return
@@ -334,7 +373,7 @@ func (q *Queue) DoneN(ms []Message) {
 
 	for _, m := range ms {
 		s := q.q[q.Msg(m.Msg)]
-		if s.size != sizeConsuming && s.size != Cancel {
+		if s.size != sizeConsuming {
 			panic("bufq: Queue misuse: done message which wasn't consumed")
 		}
 
@@ -344,6 +383,7 @@ func (q *Queue) DoneN(ms []Message) {
 	q.done()
 }
 
+// done moves qr over the retired slots and frees their buffer space.
 func (q *Queue) done() {
 	var moved bool
 
@@ -374,6 +414,7 @@ func (q *Queue) done() {
 	q.cond.Broadcast()
 }
 
+// Close wakes up all waiters. Messages already in the queue are still consumable.
 func (q *Queue) Close() error {
 	defer q.mu.Unlock()
 	q.mu.Lock()
@@ -385,27 +426,12 @@ func (q *Queue) Close() error {
 	return nil
 }
 
+// Size returns the sizes the queue was created with.
 func (q *Queue) Size() (n, buf int) {
 	return len(q.q), int(q.b)
 }
 
-func (q *Queue) len() int {
-	defer q.mu.Unlock()
-	q.mu.Lock()
-
-	n := 0
-
-	for msg := q.qr; msg < q.qw; msg++ {
-		s := q.q[q.Msg(msg)]
-
-		if s.size >= 0 {
-			n++
-		}
-	}
-
-	return n
-}
-
+// Stats returns the message and the buffer read/write positions.
 func (q *Queue) Stats() (qr, qw, r, w int64) {
 	defer q.mu.Unlock()
 	q.mu.Lock()
@@ -413,38 +439,11 @@ func (q *Queue) Stats() (qr, qw, r, w int64) {
 	return q.qr, q.qw, q.r, q.w
 }
 
-func (q *Queue) state() (x uint64) {
-	for msg := q.qr; msg < q.qw; msg++ {
-		m := q.Msg(msg)
-		s := q.q[m]
-
-		sh := 4 * int(msg-q.qr)
-		if sh >= 64 {
-			break
-		}
-
-		switch {
-		case s.size == sizeFree:
-			// x |= 0 << sh
-		case s.size == sizeAllocated:
-			x |= 1 << sh
-		case s.size >= 0:
-			x |= 2 << sh
-		case s.size == sizeConsuming:
-			x |= 3 << sh
-		case s.size == Cancel:
-			x |= 4 << sh
-		default:
-			panic(s.size)
-		}
-	}
-
-	return x
-}
-
+// Msg wraps a FlagFullMsg message number to a queue index.
 func (q *Queue) Msg(msg int64) int64 { return msg % q.qlen() }
+
 func (q *Queue) msg(msg int64) int64 {
-	if q.Flags&(1<<FlagFullMsg) != 0 {
+	if q.Flags.Is(FlagFullMsg) {
 		return msg
 	}
 
@@ -462,34 +461,6 @@ func (q *Queue) start(st int64) int {
 
 func (q *Queue) equal(x, y int64) bool { return q.Msg(x) == q.Msg(y) }
 
-func (q *Queue) pState() string {
-	return fmt.Sprintf("q %3x-%3x  b %4x-%4x  s %x", q.qr, q.qw, q.r, q.w, q.state())
-}
-
-/*
-func (q *Queue) String() string {
-	defer q.mu.Unlock()
-	q.mu.Lock()
-
-	return q.pState()
-}
-
-func (q *Queue) dump() string {
-	defer q.mu.Unlock()
-	q.mu.Lock()
-
-	var b strings.Builder
-
-	for msg := q.qr; msg < q.qw; msg++ {
-		s := q.q[q.Msg(msg)]
-
-		fmt.Fprintf(&b, "msg %4x: st %4x  size %3x\n", msg, s.start, s.size)
-	}
-
-	return b.String()
-}
-*/
-
 func (m Message) End() int             { return m.Start + m.Size }
 func (m Message) StartEnd() (int, int) { return m.Start, m.Start + m.Size }
 func (m *Message) Cancel()             { m.Size = Cancel }
@@ -505,12 +476,14 @@ func (e Error) Error() string {
 	}
 }
 
+func (f Flags) Is(v Flags) bool { return f&v == v }
+func (f *Flags) Set(v Flags)    { *f |= v }
+func (f *Flags) Unset(v Flags)  { *f &^= v }
+
 func alignAlign(align int) int {
+	if align <= 0 {
+		return align
+	}
+
 	return 1 << bits.Len(uint(align)-1)
-}
-
-func caller(d int) string {
-	_, file, line, _ := runtime.Caller(1 + d)
-
-	return fmt.Sprintf("%v:%v", filepath.Base(file), line)
 }
